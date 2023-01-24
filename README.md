@@ -1,9 +1,9 @@
 # Envrionment
-Windows 10
-Python 3.9.13
-PyTorch 1.11.0
-CUDA 11.3
-PyG
+- Windows 10
+- Python 3.9.13
+- PyTorch 1.11.0
+- CUDA 11.3
+- PyG
 
 ### Requirements
 ```
