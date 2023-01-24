@@ -1,5 +1,5 @@
 import torch
-
+import numpy as np
 
 def ndcg_binary_at_k_batch_torch(X_pred, heldout_batch, k=100, device='cpu'):
     """
@@ -13,7 +13,7 @@ def ndcg_binary_at_k_batch_torch(X_pred, heldout_batch, k=100, device='cpu'):
     heldout_batch_nonzero = (heldout_batch > 0).float()
     DCG = (heldout_batch_nonzero[torch.arange(batch_users, device=device).unsqueeze(1), idx_topk] * tp).sum(dim=1)
     heldout_nonzero = (heldout_batch > 0).sum(dim=1)  # num. of non-zero items per batch. [B]
-    IDCG = torch.tensor([(tp[:min(n, k)]).sum() for n in heldout_nonzero]).to(device)
+    IDCG = torch.tensor([(tp[:min(n, k)]).max() for n in heldout_nonzero]).to(device) #sum!!
     return DCG / IDCG
 
 

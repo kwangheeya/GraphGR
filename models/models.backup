@@ -1,0 +1,310 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from torch_geometric.nn import HeteroConv, GCNConv, SAGEConv, GATConv, Linear, to_hetero, AGNNConv
+
+import numpy as np
+
+import copy
+
+
+class GAT(torch.nn.Module):
+    def __init__(self, hidden_channels, out_channels):
+        super().__init__()
+        self.conv1 = GATConv((-1, -1), hidden_channels, add_self_loops=False)
+        self.lin1 = Linear(-1, hidden_channels)
+        self.conv2 = GATConv((-1, -1), out_channels, add_self_loops=False)
+        self.lin2 = Linear(-1, out_channels)
+        
+
+    def forward(self, x, edge_index):
+        x = self.conv1(x, edge_index) + self.lin1(x)
+        x = self.conv2(x, edge_index) + self.lin2(x)
+        return x
+
+
+class SAGE(torch.nn.Module):
+    def __init__(self, hidden_channels, out_channels):
+        super().__init__()
+        self.conv1 = SAGEConv((-1, -1), hidden_channels)
+        self.conv2 = SAGEConv((-1, -1), out_channels)
+
+    def forward(self, x, edge_index):
+        x = self.conv1(x, edge_index) 
+        x = self.conv2(x, edge_index) 
+        return x
+
+
+class ConvGR(torch.nn.Module):
+    def __init__(self, hidden_channels, metadata, num_node_info, gnn_type, device, drop_rate=0.2, edge_drop=0.95):
+        super().__init__()
+        self.device = device
+        self.drop_rate = drop_rate
+        self.edge_drop = edge_drop
+
+        # Embedding
+        self.emb = {}
+        for key in num_node_info:
+            self.emb[key] = nn.Embedding(num_node_info[key], hidden_channels).to(device)
+
+        # GNN for inductive learning
+        gnn = SAGE(hidden_channels, hidden_channels, drop_rate=drop_rate)
+        self.gnn = to_hetero(gnn, metadata, aggr='sum')    
+
+
+        # Group rating predictor
+        self.predictor = nn.Sequential(
+            #Linear(-1, hidden_channels*2),
+            #nn.ReLU(),
+            #nn.Dropout(p=drop_rate),
+            Linear(-1, num_node_info['item']),
+        )
+        # Aug rating predictor
+        self.predictor_aug = nn.Sequential(
+            #Linear(-1, hidden_channels*2),
+            #nn.ReLU(),
+            #nn.Dropout(p=drop_rate),
+            Linear(-1, num_node_info['item']),
+        )
+        self.mseloss = nn.MSELoss()
+
+
+    def forward(self, x, edge_index):       
+        emb_x = copy.copy(x)
+        for node_type in self.emb:                
+            emb_x[node_type] = self.emb[node_type](x[node_type]) 
+            if node_type == 'group':
+                emb_x[node_type] = emb_x[node_type] * 0
+            else:
+                emb_x[node_type] = F.dropout(emb_x[node_type], self.drop_rate, training=self.training)
+        rep = self.gnn(emb_x, edge_index)
+        out = {}        
+        rep['group'] = F.dropout(rep['group'], self.drop_rate, training=self.training)
+        out['group'] = self.predictor(rep['group'])   
+        if self.training:     
+            rep['user'] = F.dropout(rep['user'], self.drop_rate, training=self.training)
+            out['user'] = self.predictor(rep['user'])                   
+            # Random augmentation
+            edge_index_aug = copy.copy(edge_index)
+
+            edge_n = edge_index[('group', '', 'item')].shape[1]
+            sampled_int_arr = np.random.permutation(edge_n)[:int(edge_n*(1.0-self.edge_drop))]
+            sampled_edge_index = edge_index[('group', '', 'item')][:,sampled_int_arr]
+
+            edge_index_aug[('group', '', 'item')] = sampled_edge_index
+            edge_index_aug[('item', 'rev_', 'group')] = torch.stack((sampled_edge_index[1], sampled_edge_index[0]))
+
+            rep_aug = self.gnn(emb_x, edge_index_aug)
+            out_aug = {}
+            rep_aug['group'] = F.dropout(rep_aug['group'], self.drop_rate)
+            out_aug['group'] = self.predictor_aug(rep_aug['group']) 
+
+            rep_aug['user'] = F.dropout(rep_aug['user'], self.drop_rate)
+            out_aug['user'] = self.predictor_aug(rep_aug['user'])           
+
+            # KL-divergence Loss for knowledge distillation
+            default_dist = F.softmax(out['group'], dim=-1)
+            aug_dist = F.log_softmax(out_aug['group'], dim=-1)
+            kd_loss = F.kl_div(aug_dist, default_dist, reduction='batchmean')
+
+            # Neighbor knowledge distillation
+            '''
+            group_reps = rep['group'][edge_index[('group', '', 'user')][0]]
+            user_reps = rep_aug['user'][edge_index[('group', '', 'user')][1]]
+            mse_loss = self.mseloss(group_reps, user_reps)
+            '''
+            group_reps = out['group'][edge_index[('group', '', 'user')][0]]
+            user_reps = out_aug['user'][edge_index[('group', '', 'user')][1]]
+
+            default_dist = F.softmax(group_reps, dim=-1)
+            aug_dist = F.log_softmax(user_reps, dim=-1)
+            kd_loss += F.kl_div(aug_dist, default_dist, reduction='batchmean')   
+
+            return out, out_aug, kd_loss
+        else:
+            return out
+
+class ConvGR(torch.nn.Module):
+    def __init__(self, hidden_channels, metadata, num_node_info, gnn_type, device, drop_rate=0.2):
+        super().__init__()
+        self.device = device
+        self.drop_rate = drop_rate
+    
+        self.generator = GAT(hidden_channels, hidden_channels)     
+        self.generator = to_hetero(self.generator, metadata, aggr='sum')
+
+        self.mseloss = nn.MSELoss()
+
+        if gnn_type == "SAGE":
+            self.gnn = SAGE(hidden_channels, num_node_info['item'])
+        elif gnn_type == "GAT":
+            self.gnn = GAT(hidden_channels, num_node_info['item'])
+        else:
+            print("No such type")
+            exit()        
+        self.gnn = to_hetero(self.gnn, metadata, aggr='sum')
+
+        self.emb = {}
+        for key in num_node_info:
+            self.emb[key] = nn.Embedding(num_node_info[key], hidden_channels).to(device)
+        print(metadata)
+
+
+    def forward(self, x, edge_index):        
+        x = copy.copy(x)
+        generated_x = copy.copy(x)
+        induc_edge_index = copy.copy(edge_index)
+   
+
+        induc_edge_index[('group', '', 'item')]  = torch.empty(2, 0, dtype=torch.long).to(self.device)
+        induc_edge_index[('item', 'rev_', 'group')] = torch.empty(2, 0, dtype=torch.long).to(self.device)
+
+        if self.training:            
+            for node_type in self.emb:
+                # get embedding
+                x[node_type] = self.emb[node_type](x[node_type])
+                # random drop
+                a = (1 - self.drop_rate) * torch.ones(x[node_type].shape).to(self.device)
+                a = torch.bernoulli(a)                
+                # masking
+                if node_type == 'group':
+                    a = 0
+                generated_x[node_type] = x[node_type] * a
+            transduc_out = self.gnn(x, edge_index)
+
+            generated_x = self.generator(generated_x, edge_index)
+            #generated_x['group'] = F.normalize(generated_x['group'], p=2, dim=-1)
+            # output            
+            induc_out =  self.gnn(generated_x, induc_edge_index)
+            # reconstruction error
+            recun_loss = 0
+            for node_type in self.emb:
+                recun_loss += self.mseloss(generated_x[node_type], x[node_type])
+
+            # dimensional orthogonality    
+            decor_loss = 0   
+            '''
+            for node_type in self.emb:      
+                hp = (x[node_type] - x[node_type].mean(0)) / x[node_type].std(0)
+                hq = (generated_x[node_type] - generated_x[node_type].mean(0)) / generated_x[node_type].std(0)
+                
+                N = x[node_type].shape[0]   
+                cp = torch.mm(hp.T, hp) / N
+                cq = torch.mm(hq.T, hq) / N
+            
+                iden = torch.tensor(np.eye(cp.shape[0])).to(self.device)
+                decor_loss += (iden - cp).pow(2).sum() + (iden - cq).pow(2).sum()
+            '''
+
+
+            return transduc_out, induc_out, recun_loss, decor_loss
+        else:
+            for node_type in self.emb:                
+                x[node_type] = self.emb[node_type](x[node_type])
+                if node_type == 'group':
+                    x[node_type] = x[node_type] * 0
+            x = self.generator(x, edge_index)
+            #x['group'] = F.normalize(x['group'], p=2, dim=-1)
+            x =  self.gnn(x, induc_edge_index)      
+            return x
+
+
+class ConvGR_(torch.nn.Module):
+    def __init__(self, hidden_channels, metadata, num_node_info, gnn_type, device, drop_rate=0.0, edge_drop=0.0):
+        super().__init__()
+        self.device = device
+        self.drop_rate = drop_rate
+
+        # Embedding
+        self.transduc_emb = {}
+        self.induc_emb = {}
+        for key in num_node_info:
+            self.transduc_emb[key] = nn.Embedding(num_node_info[key], hidden_channels).to(device)
+            self.induc_emb[key] = nn.Embedding(num_node_info[key], hidden_channels).to(device)
+
+        # GNN for transductive learning
+        transduc_gnn = GAT(hidden_channels, hidden_channels, drop_rate=drop_rate)
+        self.transduc_gnn = to_hetero(transduc_gnn, metadata, aggr='sum')
+
+        # GNN for inductive learning
+        induc_gnn = GAT(hidden_channels, hidden_channels, drop_rate=drop_rate)
+        self.induc_gnn = to_hetero(induc_gnn, metadata, aggr='sum')        
+
+        # Rating predictor
+        self.predictor = nn.Sequential(
+            #nn.Dropout(p=drop_rate),
+            Linear(-1, hidden_channels),
+            nn.Dropout(p=drop_rate, training=self.training),
+            Linear(-1, num_node_info['item']),
+        )
+
+        self.mseloss = nn.MSELoss()
+
+
+    def forward(self, x, edge_index):        
+        transduc_x = copy.copy(x)
+        induc_x = copy.copy(x)
+        induc_edge_index = copy.copy(edge_index)   
+
+        induc_edge_index[('group', '', 'item')]  = torch.empty(2, 0, dtype=torch.long).to(self.device)
+        induc_edge_index[('item', 'rev_', 'group')] = torch.empty(2, 0, dtype=torch.long).to(self.device)
+
+        if self.training:            
+            for node_type in self.transduc_emb:                
+                transduc_x[node_type] = self.transduc_emb[node_type](x[node_type]) 
+
+                induc_x[node_type] = self.induc_emb[node_type](x[node_type]) 
+                if node_type == 'group':
+                    induc_x[node_type] = induc_x[node_type] * 0
+                '''
+                p = (1 - self.drop_rate) * torch.ones(transduc_x[node_type].shape).to(self.device)
+                mask = torch.bernoulli(p)
+                # get embedding
+                transduc_x[node_type] = transduc_x[node_type] * mask
+                if node_type == 'group':
+                    mask = 0
+                induc_x[node_type] = self.induc_emb[node_type](x[node_type]) * mask
+                '''
+                
+
+
+            transduc_rep = self.transduc_gnn(transduc_x, edge_index)
+            transduc_out = {}
+            transduc_out['group'] = self.predictor(transduc_rep['group'])
+
+            induc_rep = self.induc_gnn(induc_x, induc_edge_index)
+            induc_out = {}
+            induc_out['group'] = self.predictor(induc_rep['group'])
+
+            # reconstruction error
+            recun_loss = 0
+            for node_type in self.transduc_emb:
+                recun_loss += self.mseloss(induc_rep[node_type], transduc_rep[node_type])
+
+            # dimensional orthogonality    
+            decor_loss = 0   
+            '''
+            for node_type in self.transduc_emb:      
+                hp = (transduc_rep[node_type] - transduc_rep[node_type].mean(0)) / transduc_rep[node_type].std(0)
+                hq = (induc_rep[node_type] - induc_rep[node_type].mean(0)) / induc_rep[node_type].std(0)
+                
+                N = x[node_type].shape[0]   
+                cp = torch.mm(hp.T, hp) / N
+                cq = torch.mm(hq.T, hq) / N
+            
+                iden = torch.tensor(np.eye(cp.shape[0])).to(self.device)
+                decor_loss += (iden - cp).pow(2).sum() + (iden - cq).pow(2).sum()
+            '''
+
+
+            return transduc_out, induc_out, recun_loss, decor_loss
+        else:
+            for node_type in self.induc_emb:                
+                induc_x[node_type] = self.induc_emb[node_type](x[node_type])
+                if node_type == 'group':
+                    induc_x[node_type] = induc_x[node_type] * 0
+            induc_rep = self.induc_gnn(induc_x, induc_edge_index)
+            induc_out = {}
+            induc_out['group'] = self.predictor(induc_rep['group'])
+            return induc_out

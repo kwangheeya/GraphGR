@@ -14,12 +14,16 @@ class GroupDataset():
         self.df_ui = self._load_user_data()
         self.df_gi, self.df_gu, self.df_gu_train = self._load_group_data()
         self.graphdata = self._build_graph_data()
-
-    def get_test_data(self):
-        self.graphdata['group', '', 'user'].edge_index = torch.t(torch.from_numpy(self.df_gu.values.astype("int64")))
         
         self.graphdata = T.ToUndirected()(self.graphdata)
         self.graphdata = T.AddSelfLoops()(self.graphdata)
+
+    def get_test_data(self):
+        self.graphdata = self._build_graph_data()
+        self.graphdata['group', '', 'user'].edge_index = None
+        self.graphdata['group', '', 'user'].edge_index = torch.t(torch.from_numpy(self.df_gu.values.astype("int64")))
+        self.graphdata = T.ToUndirected()(self.graphdata)
+        self.graphdata = T.AddSelfLoops()(self.graphdata)        
         return self.graphdata
 
     def _build_graph_data(self):
@@ -51,8 +55,10 @@ class GroupDataset():
         test_gi_tensor = torch.from_numpy(self.test_df_gi.values.astype("int64"))
         data['group'].test_y[test_gi_tensor[:,0], test_gi_tensor[:,1]] = 1
 
-        data = T.ToUndirected()(data)
-        data = T.AddSelfLoops()(data)
+        unseen_group_idx = torch.unique(data['group'].test_y.nonzero(as_tuple=True)[0])
+        data['group'].is_train = torch.ones(self.n_groups)
+        data['group'].is_train[unseen_group_idx] = 0
+        data['group'].is_train = data['group'].is_train.to(torch.bool)
 
         return data
 
@@ -71,7 +77,7 @@ class GroupDataset():
         self.val_df_gi = pd.read_csv(val_path_gi)  # load valid group-item interactions.
 
         test_path_gi = os.path.join(self.data_dir, 'test_gi.csv')
-        self.test_df_gi = pd.read_csv(test_path_gi)  # load valid group-item interactions.  
+        self.test_df_gi = pd.read_csv(test_path_gi)  # load test group-item interactions.  
 
 
         df_gu_train = df_gu[df_gu.group.isin(df_gi['group'].unique())]
@@ -86,15 +92,7 @@ class GroupDataset():
     def _load_user_data(self):
         """ load user-item interactions of all users that appear in training groups, as a sparse matrix """
         train_path_ui = os.path.join(self.data_dir, 'train_ui.csv')
-        df_train_ui = pd.read_csv(train_path_ui)
-
-        # include users from the (fold-in item set) of validation and test sets of user-item data.
-        val_path_ui = os.path.join(self.data_dir, 'val_ui_tr.csv')
-        df_val_ui = pd.read_csv(val_path_ui)
-
-        test_path_ui = os.path.join(self.data_dir, 'test_ui_tr.csv')
-        df_test_ui = pd.read_csv(test_path_ui)
-        df_ui = pd.concat([df_train_ui, df_val_ui, df_test_ui])
+        df_ui = pd.read_csv(train_path_ui)
 
         self.n_users, self.n_items = df_ui['user'].max() + 1, df_ui['item'].max() + 1
         print('\t# users: ', self.n_users, '\n\t# items: ', self.n_items)
