@@ -21,7 +21,7 @@ class GAT(torch.nn.Module):
         x = self.conv1(x, edge_index) + self.lin1(x)
         x = F.relu(x)
         x = self.conv2(x, edge_index) + self.lin2(x)
-        x = F.relu(x)
+        #x = F.relu(x)
         return x
 
 class GATv2(torch.nn.Module):
@@ -42,16 +42,19 @@ class GATv2(torch.nn.Module):
 class SAGE(torch.nn.Module):
     def __init__(self, hidden_channels, out_channels, drop_rate=0.2):
         super().__init__()
+        self.conv0 = SAGEConv(-1, hidden_channels)
         self.conv1 = SAGEConv(-1, hidden_channels)
         self.conv2 = SAGEConv(hidden_channels, out_channels)
         self.drop_rate = drop_rate
-        
+        self.m = nn.ReLU() #nn.LeakyReLU(0.1)
 
     def forward(self, x, edge_index):
+        # x = self.conv0(x, edge_index) 
+        # x = self.m(x)
         x = self.conv1(x, edge_index) 
-        x = F.relu(x)
+        x = self.m(x)
         x = self.conv2(x, edge_index) 
-        x = F.relu(x)
+        #x = self.m(x)
         return x
 
 
@@ -107,7 +110,7 @@ class GraphGR(torch.nn.Module):
 
     def forward(self, x, edge_index):       
         emb_x = copy.copy(x)
-
+        device = x['group'].device
         for node_type in self.emb:                
             emb_x[node_type] = self.emb[node_type](x[node_type]) 
             if node_type == 'group':
@@ -117,10 +120,16 @@ class GraphGR(torch.nn.Module):
 
         if self.training:     
             # teacher model
+            #print(emb_x['group'][0])
+            #emb_x['group'] = torch.randn(emb_x['group'].shape, device=device)
             rep_tea = self.gnn(emb_x, edge_index)
             out_tea = {}        
-            rep_tea['group'] = F.dropout(rep_tea['group'], self.drop_rate)
-            out_tea['group'] = self.predictor_tea(rep_tea['group'])               
+            #print(rep_tea['group'][0])
+            rep_tea['group'] = F.dropout(rep_tea['group'], self.drop_rate)            
+            #print(rep_tea['group'][0])
+            
+            out_tea['group'] = self.predictor_tea(rep_tea['group'])         
+            #print(out_tea['group'][0])      
            
             # Random augmentation
             edge_index_aug = copy.copy(edge_index)
@@ -144,6 +153,10 @@ class GraphGR(torch.nn.Module):
             tea_dist = F.softmax(out_tea['group'], dim=-1)
             aug_dist = F.log_softmax(out_aug['group'], dim=-1)
             kd_loss = F.kl_div(aug_dist, tea_dist, reduction='batchmean')
+
+            #tea_dist = F.log_softmax(out_tea['group'], dim=-1)
+            #aug_dist = F.softmax(out_aug['group'], dim=-1)
+            #kd_loss += F.kl_div(tea_dist, aug_dist, reduction='batchmean')
 
             # Neighbor knowledge distillation
             group_reps = out_aug['group'][edge_index[('group', '', 'user')][0]]
